@@ -1,257 +1,278 @@
-# ECG Arrhythmia Classifier — FPGA Edge Device
+# 🫀 FPGA-Based ECG Arrhythmia Classification — Two-Branch DSCResNet
 
-> **Binary-first ECG preprocessing pipeline with fixed-point IIR filtering on FPGA and 1D ResNet-18 classification.**  
-> Low-power edge deployment for real-time Normal vs Abnormal beat detection using the MIT-BIH Arrhythmia Database.
+A complete two-stage pipeline for real-time ECG arrhythmia classification:
+- **Stage 1 (Software):** 4th-order Butterworth bandpass filter designed in MATLAB + a dual-branch depthwise separable convolutional neural network trained in Python (Google Colab)
+- **Stage 2 (Hardware):** The same Butterworth filter implemented in Verilog as four cascaded Q16.16 fixed-point biquad sections on a Xilinx Zynq-7020 FPGA
+
+> 📄 This project accompanies the conference paper:
+> **"FPGA-Based ECG Arrhythmia Classification Using Dual-Branch DSCResNet with Inter-Patient Evaluation"**
 
 ---
 
-## Project Overview
+## Why This Project Is Different
 
-This project implements a complete ECG arrhythmia classification system designed for low-power edge deployment on an FPGA. The system is split into three tightly coupled stages — MATLAB preprocessing, Verilog hardware filter, and deep learning classification — all sharing the same binary Q8.8 signal representation so that FPGA output can be verified integer-for-integer against the MATLAB reference.
+Most published ECG classifiers report 96–99% accuracy — but achieve it by splitting beats *randomly*, so the same patient's data appears in both training and test sets. This is data leakage, and the AAMI EC57 standard explicitly prohibits it.
+
+This project enforces **strict inter-patient evaluation**: the 8 test patients are completely unseen during training. The reported **83.11% accuracy and macro F1 of 0.521** are honest, clinically meaningful numbers.
+
+---
+
+## Results at a Glance
+
+| Metric | Value |
+|---|---|
+| Overall Accuracy | **83.11%** |
+| Macro F1-Score | **0.521** |
+| Ventricular Ectopic Recall | **79.3%** (life-critical PVCs) |
+| Supraventricular Recall | **43.2%** (PACs via RR timing) |
+| Model Size | **0.43 MB** (smallest in comparison) |
+| Parameters | 107,621 |
+| Evaluation Protocol | AAMI EC57 inter-patient ✅ |
+
+### FPGA Filter (Xilinx Zynq-7020)
+
+| Resource | Usage |
+|---|---|
+| LUTs | 2,326 (4.37%) |
+| Flip-Flops | 516 (0.48%) |
+| DSP48 Blocks | 0 |
+| Logic Power | 29 mW |
+| Max Frequency | 116.6 MHz |
+| Pipeline Latency | 4 clock cycles |
+
+---
+
+## Pipeline Overview
 
 ```
-Raw ECG (ADC)
-     │
-     ▼
-┌─────────────────────────────┐
-│  MATLAB  (Ground Truth)     │
-│  • Q8.8 quantisation        │
-│  • SOS Butterworth filter   │
-│  • Beat extraction (252 sa) │
-│  • Z-score normalisation    │
-│  • Patient-wise splitting   │
-└──────────┬──────────────────┘
-           │
-     ┌─────┴──────┐
-     ▼            ▼
-┌─────────┐  ┌──────────────────────┐
-│  Colab  │  │  Verilog / FPGA      │
-│ ResNet  │  │  • SOS filter        │
-│ 1D-18   │  │  • 4 biquad cascade  │
-│ binary  │  │  • Q16.16 coeffs     │
-│ classif.│  │  • Verified vs MATLAB│
-└─────────┘  └──────────────────────┘
-     │            │
-     └─────┬──────┘
-           ▼
-    Normal / Abnormal
-    classification output
+MIT-BIH Database (360 Hz)
+        │
+        ▼
+┌─────────────────────────────┐   STAGE 1 — SOFTWARE (MATLAB + Colab)
+│  Butterworth BPF            │   filter_design.m
+│  4th-order, 0.5–45 Hz      │   zero-phase via filtfilt()
+│  SOS coefficients exported  │
+└────────────┬────────────────┘
+             │  Same coefficients shared ──────────────────────┐
+             ▼                                                  ▼
+┌─────────────────────────────┐             ┌──────────────────────────────┐
+│  Beat Extraction            │             │  Verilog BPF (sos_filter.v)  │  STAGE 2 — HARDWARE
+│  252-sample window/beat     │             │  4 cascaded Q16.16 biquads   │  (Zynq-7020)
+│  Pan-Tompkins R-peak detect │             │  116.6 MHz, 4-cycle latency  │
+└────────────┬────────────────┘             └──────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────┐
+│  Two-Branch DSCResNet (Python/Colab)    │
+│                                         │
+│  CNN Branch          RR-MLP Branch      │
+│  (waveform shape)    (8 RR features)    │
+│       128-dim   +       32-dim          │
+│              ↓                          │
+│       160-dim Fusion Classifier         │
+│              ↓                          │
+│   N  |  S  |  V  |  F  |  U            │
+└─────────────────────────────────────────┘
 ```
+
+---
+
+## Architecture
+
+### Two-Branch DSCResNet
+
+The model processes each beat through two parallel branches:
+
+**CNN Branch — Waveform Morphology**
+- Stem convolution block → 3× DSC ResBlocks (32→64→128 channels)
+- Depthwise separable convolutions reduce MAC count ~8× vs standard convolutions
+- Global Average Pooling → 128-dimensional morphology vector
+- Captures wide, aberrant QRS morphology for Ventricular ectopic (PVC) detection
+
+**RR-MLP Branch — Rhythm Timing**
+- 8 normalized RR interval features → 2× FC layers with ReLU
+- 32-dimensional timing vector encoding rhythm context
+- Essential for Supraventricular ectopic (PAC) detection — waveform morphology alone gives 0% S-class recall; adding the RR branch brings it to 43.2%
+
+**Fusion Classifier**
+- Concatenates both vectors → 160-dimensional representation
+- 2× FC layers → 5 AAMI class logits → argmax
+
+### Why SOS for the FPGA Filter?
+
+Direct-form IIR coefficients reach values like `a = 26.3`. At Q16.16, that becomes `26.3 × 65536 = 1,722,368`. Multiplied by a 32-bit signal sample → immediate int32 overflow → garbage output.
+
+SOS splits the 8th-order polynomial into 4 cascaded 2nd-order sections where the max denominator coefficient is only `1.993`, giving `1.993 × 65536 = 130,637` — safely within the 32-bit signed range. Each biquad implements Direct Form I:
+
+```
+y[n] = B0·x[n] + B1·x[n-1] + B2·x[n-2] − A1·y[n-1] − A2·y[n-2]
+```
+
+### Exported Q16.16 SOS Coefficients (float × 65536)
+
+| Section | B0 | B1 | B2 | A1 | A2 |
+|---|---|---|---|---|---|
+| 1 | 645 | 1,289 | 645 | -57,134 | 14,251 |
+| 2 | 65,536 | 131,072 | 65,536 | -73,411 | 38,064 |
+| 3 | 65,536 | -131,072 | 65,536 | -130,003 | 64,472 |
+| 4 | 65,536 | -131,072 | 65,536 | -130,637 | 65,106 |
 
 ---
 
 ## Dataset
 
-| Property | Value |
-|---|---|
-| Source | MIT-BIH Arrhythmia Database (PhysioNet) |
-| Records | 48 |
-| Total beats | 112,536 |
-| Beat length | 252 samples (0.7 s at 360 Hz) |
-| Sampling rate | 360 Hz |
-| Labels | Normal (0) = 75,003 beats (66.6%) · Abnormal (1) = 37,533 beats (33.4%) |
-| Split strategy | Patient-wise — no patient appears in two sets |
-| Train | 34 records · 74,843 beats |
-| Val | 7 records · 18,101 beats |
-| Test | 8 records · 19,592 beats |
+**MIT-BIH Arrhythmia Database** — 48 two-lead ECG recordings, 360 Hz, 47 subjects.
+
+Beats are grouped into 5 AAMI classes:
+
+| Class | Label | Description |
+|---|---|---|
+| Normal | N | Dominant class (>85% of beats) |
+| Supraventricular ectopic | S | PAC — rhythm disorder |
+| Ventricular ectopic | V | PVC — life-critical |
+| Fusion | F | Rare class |
+| Unknown | U | Not in test split |
+
+**Inter-patient split (AAMI EC57 compliant):**
+- Train: 34 patients (100-series records)
+- Validation: 7 patients
+- Test: 8 patients (200-series records — the hardest in the database)
+- Zero beat-level overlap between any two partitions
+
+> MIT-BIH data is available free at [PhysioNet](https://physionet.org/content/mitdb/1.0.0/)
 
 ---
 
 ## Repository Structure
 
 ```
-ecg-fpga-classifier/
+ecg_fpga_classifier/
 │
-├── README.md                        ← this file
+├── matlab/
+│   ├── filter_design.m              # Butterworth BPF design + SOS export  ← run first
+│   ├── preprocessing.m              # ECG preprocessing pipeline
+│   └── data/
+│       ├── processed/
+│       │   ├── filter_coeffs.mat            # b, a, SOS (float + fixed-point)
+│       │   ├── filter_coeffs_scaled.mat     # Q16.16 direct-form (reference)
+│       │   └── butterworth_fpga_coeffs.txt  # Human-readable coefficient file
+│       ├── raw/                     # Place MIT-BIH .dat/.hea files here
+│       └── splits/                  # Train/val/test index files
 │
-├── matlab/                          ← MATLAB preprocessing pipeline
-│   ├── filter_design.m              ← Butterworth SOS design + Q16.16 coefficients
-│   ├── ecg_pipeline_corrected.m     ← Binary-first full pipeline (replaces 3 original scripts)
-│   ├── verify_binary_filter_v2.m    ← FPGA path verification (SNR = 42.5 dB, max error 0.9 LSB)
-│   └── output/
-│       ├── data/
-│       │   ├── processed/
-│       │   │   ├── filter_coeffs.mat          ← SOS + Q16.16 coefficients
-│       │   │   ├── butterworth_fpga_coeffs.txt← Human-readable coefficient table
-│       │   │   └── ecg_dataset.mat            ← Full processed dataset
-│       │   └── splits/
-│       │       ├── train.csv                  ← Float Z-scored beats (ResNet input)
-│       │       ├── val.csv
-│       │       ├── test.csv
-│       │       ├── test_with_records.csv      ← Includes record IDs for per-patient analysis
-│       │       ├── train_binary.csv           ← Q8.8 ASCII binary (Verilog $readmemb)
-│       │       ├── val_binary.csv
-│       │       ├── test_binary.csv
-│       │       ├── train_int16.bin            ← Raw int16 little-endian binary
-│       │       ├── val_int16.bin
-│       │       └── test_int16.bin
-│       └── testbench/
-│           ├── ecg_raw_binary.csv             ← FPGA input (10k samples, Record 100)
-│           └── ecg_filtered_ref.csv           ← FPGA expected output (MATLAB reference)
+├── colab/
+│   └── ecg_classifier.ipynb         # Two-branch DSCResNet training notebook
 │
-├── verilog/                         ← FPGA SOS filter implementation
-│   ├── biquad_section.v             ← Single second-order IIR section (reusable)
-│   ├── sos_filter.v                 ← Top-level: gain stage + 4 cascaded biquads
-│   ├── sos_filter_tb.v              ← Testbench: loads MATLAB CSVs, integer comparison
-│   └── README.md                    ← Vivado setup instructions
+├── verilog/
+│   ├── sos_filter.v                 # Top-level 4-stage cascaded biquad filter
+│   ├── biquad_section.v             # Single Direct Form I biquad
+│   └── tb_sos_filter.v              # Testbench (reads input_stimulus.txt)
 │
-├── colab/                           ← Google Colab ResNet training
-│   └── ECG_ResNet_Fixed_v2.ipynb   ← 1D ResNet-18, fixed overfitting (v2)
+├── weights/
+│   └── best.pt                      # Best model checkpoint (epoch 14)
 │
-└── results/                         ← Simulation and training outputs (added after runs)
-    ├── vivado/
-    │   └── simulation_log.txt       ← Per-sample DUT vs MATLAB comparison
-    └── colab/
-        ├── training_curves.png
-        ├── confusion_roc.png
-        ├── per_record_accuracy.png
-        └── sample_beats.png
+├── results/
+│   └── confusion_matrix.png
+│
+└── input_stimulus.txt               # 100-sample 10 Hz sine test vector for Verilog TB
 ```
 
 ---
 
-## Filter Design
+## Getting Started
 
-4th-order Butterworth bandpass filter — 0.5 Hz to 45 Hz at 360 Hz sampling rate.  
-Implemented as 4 cascaded second-order sections (biquads) to avoid fixed-point overflow in direct form.
+### Prerequisites
 
-| Property | Value |
-|---|---|
-| Filter type | Butterworth bandpass |
-| Order | 4th (8th-order polynomial → 4 biquads) |
-| Passband | 0.5 – 45 Hz |
-| Sampling rate | 360 Hz |
-| Implementation | Cascaded SOS (Direct Form II) |
-| Signal format | Q8.8 signed 16-bit |
-| Coefficient format | Q16.16 signed 32-bit |
-| Gain | 645 (= 0.009838 × 65536) |
-
-### Q16.16 Coefficients (from `filter_design.m`)
-
-```
-Section 1:  B = [ 65536  -131072   65536]   A = [65536   -57134   14251]
-Section 2:  B = [ 65536   131080   65544]   A = [65536   -73411   38064]
-Section 3:  B = [ 65536   131064   65528]   A = [65536  -130003   64472]
-Section 4:  B = [ 65536  -131072   65536]   A = [65536  -130637   65106]
-```
-
-### Verification Results
-
-| Metric | Value |
-|---|---|
-| Max error (Path A vs Path B) | 0.9 LSB = 0.0037 mV |
-| SNR | 42.5 dB |
-| Verilog vs MATLAB mismatches | 0 (target — pending Vivado run) |
-| FPGA resource estimate | ~21 DSP48 slices, <1% LUTs, <1% FFs |
-
----
-
-## ResNet-18 1D Classifier
-
-| Property | Value |
-|---|---|
-| Architecture | 1D ResNet-18 (Conv1D residual blocks) |
-| Input | (batch, 1, 252) — Z-scored ECG beat |
-| Output | (batch, 2) — logits for [Normal, Abnormal] |
-| Parameters | 8,727,874 |
-| Loss | CrossEntropyLoss (weighted + label smoothing 0.1) |
-| Optimiser | Adam lr=1e-3, weight decay=1e-3 |
-| Scheduler | CosineAnnealingLR |
-| Early stopping | Patience = 10 epochs on val F1 |
-| Dropout | 0.5 (v2 fix — was 0.3) |
-| Class weights | Normal=1.0, Abnormal=1.97 (ratio-based) |
-| Target accuracy | 95%+ on patient-wise test set |
-
-### Training Status
-
-| Run | Val F1 | Test Acc | Test F1 | AUC | Status |
-|---|---|---|---|---|---|
-| v1 (original) | 0.8628 (ep 2) | 76.63% | 0.6363 | 0.8238 | Overfit — best at epoch 2 |
-| v2 (fixed) | — | — | — | — | Pending |
-
----
-
-## Progress Tracker
-
-| Stage | Status | Notes |
+| Tool | Purpose | Notes |
 |---|---|---|
-| MATLAB filter design | ✅ Complete | 4 SOS sections, Q16.16 coefficients |
-| MATLAB pipeline | ✅ Complete | 112,536 beats, patient-wise splits |
-| MATLAB verification | ✅ Complete | SNR 42.5 dB, max error 0.9 LSB |
-| Verilog SOS filter | ⏳ Simulation pending | Code written, Vivado run needed |
-| Verilog testbench | ⏳ Simulation pending | Awaiting PASS confirmation |
-| ResNet v2 training | ⏳ Pending | ECG_ResNet_Fixed_v2.ipynb ready |
-| R-peak detector | 🔲 Not started | After Verilog filter verified |
-| Beat windowing | 🔲 Not started | After R-peak detector |
-| Z-score normaliser | 🔲 Not started | After beat windowing |
-| Full system integration | 🔲 Not started | Final stage |
+| MATLAB + Signal Processing Toolbox | Filter design & preprocessing | R2021a or later |
+| Python 3.8+ / Google Colab | Model training | Free Colab tier sufficient |
+| PyTorch 1.12+ | Neural network | `pip install torch` |
+| Xilinx Vivado | FPGA synthesis | 2022.1 or later, free WebPACK edition works |
 
----
-
-## How to Run
-
-### MATLAB (run in this order)
+### Step 1 — Design the Filter (MATLAB)
 
 ```matlab
-% Step 1 — Design filter and save coefficients
+% Run this FIRST before anything else
 run('matlab/filter_design.m')
-
-% Step 2 — Process all 48 MIT-BIH records (takes ~10 min)
-run('matlab/ecg_pipeline_corrected.m')
-
-% Step 3 — Verify FPGA path matches MATLAB reference
-run('matlab/verify_binary_filter_v2.m')
-% Expected: PASS — max error <= 2 LSB, SNR > 40 dB
 ```
 
-**Prerequisites:**
-- WFDB Toolbox for MATLAB — [physionet.org/content/wfdb-matlab](https://physionet.org/content/wfdb-matlab)
-- MIT-BIH Arrhythmia Database — [physionet.org/content/mitdb](https://physionet.org/content/mitdb)
+This will design the 4th-order Butterworth bandpass filter, export SOS and Q16.16 fixed-point coefficients, generate the `input_stimulus.txt` Verilog test vector, and plot the magnitude and phase frequency response.
 
-### Verilog (Xilinx Vivado)
+### Step 2 — Preprocess ECG Data (MATLAB)
 
-1. Create RTL project, add `biquad_section.v` and `sos_filter.v` as design sources
-2. Add `sos_filter_tb.v` as simulation source
-3. Copy `ecg_raw_binary.csv` and `ecg_filtered_ref.csv` into the Vivado project folder
-4. Set `sos_filter_tb` as simulation top, run Behavioral Simulation
-5. Expected console output: `PASS -- output matches MATLAB exactly`
+```matlab
+% Requires MIT-BIH .dat/.hea files placed in matlab/data/raw/
+run('matlab/preprocessing.m')
+```
 
-### Google Colab (ResNet training)
+Applies the Butterworth filter via `filtfilt` (zero-phase), detects R-peaks using a simplified Pan-Tompkins algorithm, extracts 252-sample beat windows (108 pre + 144 post R-peak), computes 8 RR interval features, and saves inter-patient train/val/test splits.
 
-1. Open `colab/ECG_ResNet_Fixed_v2.ipynb` in Google Colab
-2. Runtime → Change runtime type → T4 GPU
-3. Run Cell 1 (imports), then Cell 2 (upload train.csv, val.csv, test.csv, test_with_records.csv)
-4. Run all remaining cells in order
-5. Expected: test accuracy ≥ 95%, training curves saved, weights downloaded
+### Step 3 — Train the Classifier (Google Colab)
 
----
+1. Open `colab/ecg_classifier.ipynb` in Google Colab
+2. Upload the processed split files from `matlab/data/splits/`
+3. Run all cells — training takes ~30 epochs
+4. Download `best.pt` from the output
 
-## Key Design Decisions
+### Step 4 — Synthesize the FPGA Filter (Vivado)
 
-**Why SOS instead of direct-form filter?**  
-The direct-form 8th-order polynomial has a maximum `a` coefficient of 23.56. In Q16.16 this is 1,543,722 — multiplied by a signal sample it overflows a 32-bit accumulator. SOS biquads have maximum `|a|` of 1.993, giving 130,637 in Q16.16 — safe for 32-bit arithmetic in each DSP48 slice.
+1. Create a new RTL project targeting `xc7z020clg400-1`
+2. Add `verilog/sos_filter.v` and `verilog/biquad_section.v` as design sources
+3. Add `verilog/tb_sos_filter.v` as simulation source
+4. Run behavioral simulation using `input_stimulus.txt` to verify filter output
+5. Run Synthesis → Implementation → check timing report for WNS ≥ 0 ns
 
-**Why `sosfilt` not `filtfilt` in MATLAB?**  
-`filtfilt` is zero-phase — it processes the signal backwards in time to cancel group delay. The FPGA processes samples causally (one at a time, forward only). Using `sosfilt` in MATLAB exactly matches the causal behaviour of the hardware.
-
-**Why Q8.8 for the signal and Q16.16 for coefficients?**  
-ECG amplitude range (±2 mV) fits comfortably in 8 integer bits. Coefficient precision needs to be higher because rounding errors in feedback coefficients accumulate in the recursive filter — Q16.16 keeps coefficient error below 0.002%.
-
-**Why patient-wise splitting?**  
-Beat-wise splits leak patient identity into both train and test sets — the model memorises patient-specific morphology and reports inflated accuracy. Patient-wise splitting tests genuine generalisation across unseen patients, which is the clinically meaningful evaluation.
+Expected results: 2,326 LUTs, 516 FFs, 0 DSP48s, Fmax ≥ 116.6 MHz.
 
 ---
 
-## References
+## Training Configuration
 
-- Moody G, Mark R. *The impact of the MIT-BIH Arrhythmia Database.* IEEE Engineering in Medicine and Biology Magazine, 2001.
-- Pan J, Tompkins W. *A real-time QRS detection algorithm.* IEEE Transactions on Biomedical Engineering, 1985.
-- He K et al. *Deep Residual Learning for Image Recognition.* CVPR 2016.
-- Association for the Advancement of Medical Instrumentation. *ANSI/AAMI EC57: Testing and reporting performance results of cardiac rhythm and ST segment measurement algorithms.* 2012.
+| Hyperparameter | Value |
+|---|---|
+| Optimizer | AdamW |
+| Learning Rate | 5 × 10⁻⁵ |
+| Weight Decay | 1 × 10⁻² |
+| Epochs | 30 (best checkpoint at epoch 14) |
+| Class Weighting | Square-root inverse |
+| Label Smoothing | 0.10 |
+| LR Schedule | ReduceLROnPlateau (factor 0.5, patience 5) |
 
 ---
 
-## Author
+## Citation
 
-Project developed as part of a Major Project on low-power FPGA-based ECG classification.  
-Supervisor guidance: DSP-first approach — verify hardware filter before AI model.
+If you use this code, filter coefficients, or architecture in your research, please cite:
+
+```bibtex
+@inproceedings{ecg_fpga_dscresnet,
+  title     = {FPGA-Based ECG Arrhythmia Classification Using Dual-Branch DSCResNet with Inter-Patient Evaluation},
+  author    = {Juanita Martina T and Suprita T and Anuraj V and Vinoth Raj R and Dhandapani Vaithiyanathan},
+  booktitle = {[Conference Name and Year]},
+  year      = {2024}
+}
+```
+
+---
+
+## License
+
+This project is released under the [MIT License](LICENSE). Feel free to use, build upon, and adapt with attribution.
+
+---
+
+## Authors
+
+| Name | Institution |
+|---|---|
+| Suprita T | SRM Institute of Science and Technology, Tiruchirappalli |
+| Juanita Martina T | SRM Institute of Science and Technology, Tiruchirappalli |
+| Anuraj V | National Institute of Technology Delhi |
+| Vinoth Raj R | SRM Institute of Science and Technology, Tiruchirappalli |
+| Dhandapani Vaithiyanathan | National Institute of Technology Delhi |
+
+---
+
+## Acknowledgements
+
+MIT-BIH Arrhythmia Database courtesy of [PhysioNet](https://physionet.org). FPGA synthesis on Xilinx Zynq-7020 using Vivado Design Suite.
